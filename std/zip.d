@@ -405,6 +405,41 @@ final class ArchiveMember
     assertThrown!ZipException(am.compressionMethod(CompressionMethod.deflate));
 }
 
+private @safe pure nothrow @nogc bool hasUnsafeArchivePath(scope const(char)[] path)
+{
+    if (path.length == 0)
+        return true;
+
+    if (path[0] == '/' || path[0] == '\\')
+        return true;
+
+    if (path.length >= 2 && path[1] == ':' &&
+        ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')))
+        return true;
+
+    size_t start = 0;
+    while (start < path.length)
+    {
+        size_t end = start;
+        while (end < path.length && path[end] != '/' && path[end] != '\\')
+            ++end;
+
+        auto segment = path[start .. end];
+        if (segment.length == 0 || segment == "." || segment == "..")
+            return true;
+
+        foreach (c; segment)
+        {
+            if (c == '\0')
+                return true;
+        }
+
+        start = end + 1;
+    }
+
+    return false;
+}
+
 /**
  * Object representing the entire archive.
  * ZipArchives are collections of ArchiveMembers.
@@ -525,6 +560,9 @@ public:
      */
     @safe void addMember(ArchiveMember de)
     {
+        enforce!ZipException(!hasUnsafeArchivePath(de.name),
+            "archive member has unsafe path");
+
         _directory[de.name] = de;
         if (!de._compressedData.length)
         {
@@ -564,6 +602,16 @@ public:
         ZipArchive zip = new ZipArchive();
 
         assertThrown!ZipException(zip.addMember(am));
+
+        am = new ArchiveMember();
+        am.compressionMethod = CompressionMethod.none;
+        am.expandedData = [cast(ubyte) 'x'];
+
+        foreach (name; ["../secret", "./file", "/abs", "\\abs", "C:\\boot.ini"])
+        {
+            am.name = name;
+            assertThrown!ZipException(zip.addMember(am));
+        }
     }
 
     /**
@@ -900,6 +948,8 @@ public:
                                  "invalid field lengths in file header found");
 
             de.name = cast(string)(_data[i .. i + namelen]);
+            enforce!ZipException(!hasUnsafeArchivePath(de.name),
+                                 "archive member has unsafe path");
             i += namelen;
             de.extra = _data[i .. i + extralen];
             i += extralen;
@@ -1074,6 +1124,33 @@ public:
     @system unittest
     {
         import std.exception : assertThrown;
+        import std.algorithm.searching : countUntil;
+        import std.string : representation;
+
+        ArchiveMember member = new ArchiveMember();
+        member.name = "abcd.txt";
+        member.expandedData("x".dup.representation);
+
+        auto zip = new ZipArchive();
+        zip.addMember(member);
+
+        auto crafted = cast(ubyte[]) zip.build().dup;
+        immutable oldName = cast(ubyte[]) "abcd.txt";
+        immutable newName = cast(ubyte[]) "../x.txt";
+
+        size_t pos;
+        while (pos < crafted.length)
+        {
+            immutable idx = countUntil(crafted[pos .. $], oldName);
+            if (idx < 0)
+                break;
+
+            pos += cast(size_t) idx;
+            crafted[pos .. pos + oldName.length] = newName[];
+            pos += oldName.length;
+        }
+
+        assertThrown!ZipException(new ZipArchive(cast(void[]) crafted));
 
         // wrong central file header signature
         auto file =
